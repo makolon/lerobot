@@ -182,14 +182,14 @@ class BimanualTeleopSocketSender:
         # Extract position and orientation
         left_pose = PoseData(
             position=left_transform[:3, 3],
-            orientation=Rotation.from_matrix(left_transform[:3, :3]).as_rotvec(),
+            orientation=Rotation.from_matrix(left_transform[:3, :3]).as_quat(),
             gripper_command=left_gripper_cmd,
             timestamp=time.time()
         )
 
         right_pose = PoseData(
             position=right_transform[:3, 3],
-            orientation=Rotation.from_matrix(right_transform[:3, :3]).as_rotvec(),
+            orientation=Rotation.from_matrix(right_transform[:3, :3]).as_quat(),
             gripper_command=right_gripper_cmd,
             timestamp=time.time()
         )
@@ -202,27 +202,29 @@ class BimanualTeleopSocketSender:
             "timestamp": time.time(),
             "left_arm": {
                 "position": {
-                    "x": float(left_pose.position[0]),
-                    "y": float(left_pose.position[1]),
-                    "z": float(left_pose.position[2])
+                    "px": float(left_pose.position[0]),
+                    "py": float(left_pose.position[1]),
+                    "pz": float(left_pose.position[2])
                 },
                 "orientation": {
-                    "wx": float(left_pose.orientation[0]),
-                    "wy": float(left_pose.orientation[1]),
-                    "wz": float(left_pose.orientation[2])
+                    "qx": float(left_pose.orientation[0]),
+                    "qy": float(left_pose.orientation[1]),
+                    "qz": float(left_pose.orientation[2]),
+                    "qw": float(left_pose.orientation[3])
                 },
                 "gripper": float(left_pose.gripper_command)
             },
             "right_arm": {
                 "position": {
-                    "x": float(right_pose.position[0]),
-                    "y": float(right_pose.position[1]),
-                    "z": float(right_pose.position[2])
+                    "px": float(right_pose.position[0]),
+                    "py": float(right_pose.position[1]),
+                    "pz": float(right_pose.position[2])
                 },
                 "orientation": {
-                    "wx": float(right_pose.orientation[0]),
-                    "wy": float(right_pose.orientation[1]),
-                    "wz": float(right_pose.orientation[2])
+                    "qx": float(right_pose.orientation[0]),
+                    "qy": float(right_pose.orientation[1]),
+                    "qz": float(right_pose.orientation[2]),
+                    "qw": float(right_pose.orientation[3])
                 },
                 "gripper": float(right_pose.gripper_command)
             }
