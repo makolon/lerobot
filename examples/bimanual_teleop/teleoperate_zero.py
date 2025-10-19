@@ -18,7 +18,6 @@ class PoseData:
     """Structure to hold pose data with position, orientation, gripper state, and joint positions"""
     position: np.ndarray  # [x, y, z]
     orientation: np.ndarray  # [qx, qy, qz, qw] - quaternion
-    gripper_command: float  # Gripper joint command (0 or 1 based on threshold)
     joint_positions: np.ndarray  # Joint positions in degrees
     timestamp: float
 
@@ -114,43 +113,31 @@ class BimanualTeleopZeroMQSender:
 
         print(f"ZeroMQ publisher connected to {zmq_address}")
 
-    def get_joint_positions_and_gripper(self):
-        """Get current joint positions and gripper commands from both arms"""
+    def get_joint_positions(self):
+        """Get current joint positions from both arms"""
         action_dict = self.teleop.get_action()
 
-        # Get joint names (excluding gripper) in the same order as kinematics
-        left_joint_names = [name for name in self.teleop.left_arm.bus.motors if name != "gripper"]
-        right_joint_names = [name for name in self.teleop.right_arm.bus.motors if name != "gripper"]
+        # Get joint names in the same order as kinematics
+        left_joint_names = self.teleop.left_arm.bus.motors
+        right_joint_names = self.teleop.right_arm.bus.motors
 
         # Extract joint positions for left arm in correct order
         left_joints = []
-        left_gripper = None
         for motor_name in left_joint_names:
             key = f"left_{motor_name}.pos"
             if key in action_dict:
                 left_joints.append(action_dict[key])
 
-        # Get left gripper
-        left_gripper_key = "left_gripper.pos"
-        if left_gripper_key in action_dict:
-            left_gripper = action_dict[left_gripper_key]
-
         # Extract joint positions for right arm in correct order
         right_joints = []
-        right_gripper = None
         for motor_name in right_joint_names:
             key = f"right_{motor_name}.pos"
             if key in action_dict:
                 right_joints.append(action_dict[key])
 
-        # Get right gripper
-        right_gripper_key = "right_gripper.pos"
-        if right_gripper_key in action_dict:
-            right_gripper = action_dict[right_gripper_key]
+        return np.array(left_joints), np.array(right_joints)
 
-        return np.array(left_joints), np.array(right_joints), left_gripper, right_gripper
-
-    def compute_end_effector_poses(self, left_joints, right_joints, left_gripper, right_gripper):
+    def compute_end_effector_poses(self, left_joints, right_joints):
         """Compute end effector poses from joint positions and process gripper commands"""
         if self.left_kinematics is None or self.right_kinematics is None:
             return None, None
@@ -169,15 +156,10 @@ class BimanualTeleopZeroMQSender:
             print(f"Left joints size: {left_joints.size}, Right joints size: {right_joints.size}")
             return None, None
 
-        # Process gripper commands using threshold
-        left_gripper_cmd = 1.0 if left_gripper is not None and left_gripper >= self.gripper_threshold else 0.0
-        right_gripper_cmd = 1.0 if right_gripper is not None and right_gripper >= self.gripper_threshold else 0.0
-
         # Extract position and orientation
         left_pose = PoseData(
             position=left_transform[:3, 3],
             orientation=Rotation.from_matrix(left_transform[:3, :3]).as_quat(),
-            gripper_command=left_gripper_cmd,
             joint_positions=left_joints,
             timestamp=time.time()
         )
@@ -185,7 +167,6 @@ class BimanualTeleopZeroMQSender:
         right_pose = PoseData(
             position=right_transform[:3, 3],
             orientation=Rotation.from_matrix(right_transform[:3, :3]).as_quat(),
-            gripper_command=right_gripper_cmd,
             joint_positions=right_joints,
             timestamp=time.time()
         )
@@ -208,7 +189,6 @@ class BimanualTeleopZeroMQSender:
                     "qz": float(left_pose.orientation[2]),
                     "qw": float(left_pose.orientation[3])
                 },
-                "gripper": float(left_pose.gripper_command),
                 "joint_positions": [float(jp) for jp in left_pose.joint_positions]
             },
             "right_arm": {
@@ -223,7 +203,6 @@ class BimanualTeleopZeroMQSender:
                     "qz": float(right_pose.orientation[2]),
                     "qw": float(right_pose.orientation[3])
                 },
-                "gripper": float(right_pose.gripper_command),
                 "joint_positions": [float(jp) for jp in right_pose.joint_positions]
             }
         }
@@ -251,17 +230,16 @@ class BimanualTeleopZeroMQSender:
 
             try:
 
-                # Get joint positions and gripper commands from both arms
-                left_joints, right_joints, left_gripper, right_gripper = self.get_joint_positions_and_gripper()
+                # Get joint positions from both arms
+                left_joints, right_joints = self.get_joint_positions()
 
                 # Debug: Print joint array sizes occasionally
                 if int(time.time() * 10) % 50 == 0:  # Print every 5 seconds
                     print(f"Debug: Left joints shape: {left_joints.shape}, Right joints shape: {right_joints.shape}")
-                    print(f"Debug: Left gripper: {left_gripper}, Right gripper: {right_gripper}")
 
                 if left_joints.size > 0 and right_joints.size > 0:
                     # Compute end effector poses with gripper commands
-                    left_pose, right_pose = self.compute_end_effector_poses(left_joints, right_joints, left_gripper, right_gripper)
+                    left_pose, right_pose = self.compute_end_effector_poses(left_joints, right_joints)
 
                     if left_pose is not None and right_pose is not None:
                         # Create and send message
@@ -272,8 +250,8 @@ class BimanualTeleopZeroMQSender:
 
                         # Debug output (reduce frequency for readability)
                         if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
-                            print(f"Left - Pos: {left_pose.position}, Rot: {left_pose.orientation}, Gripper: {left_pose.gripper_command}")
-                            print(f"Right - Pos: {right_pose.position}, Rot: {right_pose.orientation}, Gripper: {right_pose.gripper_command}")
+                            print(f"Left - Pos: {left_pose.position}, Rot: {left_pose.orientation}")
+                            print(f"Right - Pos: {right_pose.position}, Rot: {right_pose.orientation}")
 
             except KeyboardInterrupt:
                 print("\nShutting down...")
