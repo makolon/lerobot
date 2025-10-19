@@ -1,10 +1,10 @@
-import contextlib
+import argparse
 import json
-import socket
 import time
 from dataclasses import dataclass
 
 import numpy as np
+import zmq
 
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.teleoperators.bi_so100_leader.bi_so100_leader import BiSO100Leader
@@ -15,22 +15,23 @@ from lerobot.utils.rotation import Rotation
 
 @dataclass
 class PoseData:
-    """Structure to hold pose data with position, orientation, and gripper state"""
+    """Structure to hold pose data with position, orientation, gripper state, and joint positions"""
     position: np.ndarray  # [x, y, z]
-    orientation: np.ndarray  # [qx, qy, qz, qw]
+    orientation: np.ndarray  # [qx, qy, qz, qw] - quaternion
     gripper_command: float  # Gripper joint command (0 or 1 based on threshold)
+    joint_positions: np.ndarray  # Joint positions in degrees
     timestamp: float
 
 
-class BimanualTeleopSocketSender:
-    """Sends bimanual SO100 leader End Effector poses via socket at high frequency"""
+class BimanualTeleopZeroMQSender:
+    """Sends bimanual SO100 leader End Effector poses via ZeroMQ at high frequency"""
 
     def __init__(
         self,
         left_arm_port: str,
         right_arm_port: str,
-        socket_host: str = "localhost",
-        socket_port: int = 12345,
+        server_ip: str = "localhost",
+        zmq_port: int = 5555,
         urdf_path: str = "./SO101/so101_new_calib.urdf",
         frequency: float = 100.0,
         calibration_dir: str = None,
@@ -42,16 +43,16 @@ class BimanualTeleopSocketSender:
         Args:
             left_arm_port: Serial port for left SO100 leader arm
             right_arm_port: Serial port for right SO100 leader arm
-            socket_host: Host address for socket connection
-            socket_port: Port for socket connection
+            server_ip: IP address of the server to send data to
+            zmq_port: ZeroMQ port number
             urdf_path: Path to the robot URDF file
             frequency: Transmission frequency in Hz
             calibration_dir: Directory for calibration files
             gripper_threshold: Threshold value for gripper command (above=1, below=0)
         """
         self.frequency = frequency
-        self.socket_host = socket_host
-        self.socket_port = socket_port
+        self.server_ip = server_ip
+        self.zmq_port = zmq_port
         self.gripper_threshold = gripper_threshold
 
         # Initialize bimanual leader configuration
@@ -82,12 +83,12 @@ class BimanualTeleopSocketSender:
             joint_names=right_joint_names,
         )
 
-        # Socket connection
-        self.socket = None
-        self.connected_clients = []
+        # ZeroMQ connection
+        self.zmq_context = None
+        self.zmq_socket = None
 
     def connect(self):
-        """Connect to the teleoperator and setup socket server"""
+        """Connect to the teleoperator and setup ZeroMQ publisher"""
         print("Connecting to bimanual SO100 leader...")
         self.teleop.connect()
 
@@ -96,29 +97,22 @@ class BimanualTeleopSocketSender:
 
         print("Connected to bimanual SO100 leader")
 
-        # Setup socket server
-        self.setup_socket_server()
+        # Setup ZeroMQ communication
+        self.setup_zeromq()
 
-    def setup_socket_server(self):
-        """Setup TCP socket server for pose transmission"""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind((self.socket_host, self.socket_port))
-        self.socket.listen(5)
-        self.socket.settimeout(0.001)  # Non-blocking with short timeout
-        print(f"Socket server listening on {self.socket_host}:{self.socket_port}")
+    def setup_zeromq(self):
+        """Setup ZeroMQ publisher for pose transmission"""
+        self.zmq_context = zmq.Context()
+        self.zmq_socket = self.zmq_context.socket(zmq.PUB)
 
-    def accept_new_clients(self):
-        """Accept new client connections (non-blocking)"""
-        try:
-            client_socket, address = self.socket.accept()
-            client_socket.settimeout(0.001)  # Non-blocking
-            self.connected_clients.append(client_socket)
-            print(f"New client connected from {address}")
-        except TimeoutError:
-            pass  # No new connections
-        except Exception as e:
-            print(f"Error accepting client: {e}")
+        # Connect to server
+        zmq_address = f"tcp://{self.server_ip}:{self.zmq_port}"
+        self.zmq_socket.connect(zmq_address)
+
+        # Give ZeroMQ time to establish connection
+        time.sleep(0.1)
+
+        print(f"ZeroMQ publisher connected to {zmq_address}")
 
     def get_joint_positions_and_gripper(self):
         """Get current joint positions and gripper commands from both arms"""
@@ -184,6 +178,7 @@ class BimanualTeleopSocketSender:
             position=left_transform[:3, 3],
             orientation=Rotation.from_matrix(left_transform[:3, :3]).as_quat(),
             gripper_command=left_gripper_cmd,
+            joint_positions=left_joints,
             timestamp=time.time()
         )
 
@@ -191,13 +186,14 @@ class BimanualTeleopSocketSender:
             position=right_transform[:3, 3],
             orientation=Rotation.from_matrix(right_transform[:3, :3]).as_quat(),
             gripper_command=right_gripper_cmd,
+            joint_positions=right_joints,
             timestamp=time.time()
         )
 
         return left_pose, right_pose
 
     def create_pose_message(self, left_pose, right_pose):
-        """Create JSON message with both arm poses and gripper commands"""
+        """Create JSON message with both arm poses, gripper commands, and joint positions"""
         message = {
             "timestamp": time.time(),
             "left_arm": {
@@ -212,7 +208,8 @@ class BimanualTeleopSocketSender:
                     "qz": float(left_pose.orientation[2]),
                     "qw": float(left_pose.orientation[3])
                 },
-                "gripper": float(left_pose.gripper_command)
+                "gripper": float(left_pose.gripper_command),
+                "joint_positions": [float(jp) for jp in left_pose.joint_positions]
             },
             "right_arm": {
                 "position": {
@@ -226,32 +223,26 @@ class BimanualTeleopSocketSender:
                     "qz": float(right_pose.orientation[2]),
                     "qw": float(right_pose.orientation[3])
                 },
-                "gripper": float(right_pose.gripper_command)
+                "gripper": float(right_pose.gripper_command),
+                "joint_positions": [float(jp) for jp in right_pose.joint_positions]
             }
         }
         return json.dumps(message) + "\n"
 
     def send_to_clients(self, message):
-        """Send message to all connected clients"""
-        disconnected_clients = []
-
-        for client in self.connected_clients:
-            try:
-                client.send(message.encode('utf-8'))
-            except (OSError, BrokenPipeError):
-                disconnected_clients.append(client)
-
-        # Remove disconnected clients
-        for client in disconnected_clients:
-            with contextlib.suppress(Exception):
-                client.close()
-            self.connected_clients.remove(client)
-            print("Client disconnected")
+        """Send message via ZeroMQ publisher"""
+        try:
+            # Send with topic "pose" for filtering on subscriber side
+            self.zmq_socket.send_string(f"pose {message}", zmq.NOBLOCK)
+        except zmq.Again:
+            # Queue is full, skip this message
+            pass
+        except Exception as e:
+            print(f"Error sending via ZeroMQ: {e}")
 
     def run_teleop_loop(self):
         """Main teleoperation loop"""
-        print(f"Starting bimanual teleop loop at {self.frequency} Hz...")
-        print("Waiting for client connections...")
+        print(f"Starting bimanual teleop loop at {self.frequency} Hz using ZeroMQ...")
 
         loop_duration = 1.0 / self.frequency
 
@@ -259,8 +250,6 @@ class BimanualTeleopSocketSender:
             loop_start = time.perf_counter()
 
             try:
-                # Accept new client connections
-                self.accept_new_clients()
 
                 # Get joint positions and gripper commands from both arms
                 left_joints, right_joints, left_gripper, right_gripper = self.get_joint_positions_and_gripper()
@@ -278,8 +267,8 @@ class BimanualTeleopSocketSender:
                         # Create and send message
                         message = self.create_pose_message(left_pose, right_pose)
 
-                        if self.connected_clients:
-                            self.send_to_clients(message)
+                        # Send via ZeroMQ
+                        self.send_to_clients(message)
 
                         # Debug output (reduce frequency for readability)
                         if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
@@ -297,52 +286,91 @@ class BimanualTeleopSocketSender:
             busy_wait(max(loop_duration - elapsed, 0.0))
 
     def disconnect(self):
-        """Disconnect from devices and close socket"""
+        """Disconnect from devices and close ZeroMQ"""
         if self.teleop:
             self.teleop.disconnect()
 
-        # Close all client connections
-        for client in self.connected_clients:
-            with contextlib.suppress(Exception):
-                client.close()
-
-        # Close server socket
-        if self.socket:
-            self.socket.close()
+        # Close ZeroMQ
+        if self.zmq_socket:
+            self.zmq_socket.close()
+        if self.zmq_context:
+            self.zmq_context.term()
 
         print("Disconnected successfully")
 
 
 def main():
-    """Main function to run the bimanual teleop socket sender"""
+    """Main function to run the bimanual teleop ZeroMQ sender"""
 
-    # Configuration - Update these ports according to your setup
-    left_arm_port = "/dev/tty.usbmodem5A7A0178511"  # Update with your left arm port
-    right_arm_port = "/dev/tty.usbmodem5A7A0181491"  # Update with your right arm port
+    parser = argparse.ArgumentParser(
+        description="Bimanual SO100 Leader Teleoperation with ZeroMQ Transmission"
+    )
 
-    # Socket configuration
-    socket_host = "localhost"
-    socket_port = 12345
+    # Required arguments
+    parser.add_argument(
+        "--left-arm-port",
+        type=str,
+        required=True,
+        help="Serial port for left SO100 leader arm (e.g., /dev/tty.usbmodem5A7A0178511)"
+    )
+    parser.add_argument(
+        "--right-arm-port",
+        type=str,
+        required=True,
+        help="Serial port for right SO100 leader arm (e.g., /dev/tty.usbmodem5A7A0181491)"
+    )
+    parser.add_argument(
+        "--server-ip",
+        type=str,
+        required=True,
+        help="IP address of the server to send data to (e.g., 192.168.1.100 or localhost)"
+    )
 
-    # URDF path - Download from https://github.com/TheRobotStudio/SO-ARM100
-    urdf_path = "./SO101/so101_new_calib.urdf"
+    # Optional arguments
+    parser.add_argument(
+        "--zmq-port",
+        type=int,
+        default=5555,
+        help="ZeroMQ port number (default: 5555)"
+    )
+    parser.add_argument(
+        "--urdf-path",
+        type=str,
+        default="./SO101/so101_new_calib.urdf",
+        help="Path to the robot URDF file (default: ./SO101/so101_new_calib.urdf)"
+    )
+    parser.add_argument(
+        "--frequency",
+        type=float,
+        default=100.0,
+        help="Transmission frequency in Hz (default: 100.0)"
+    )
+    parser.add_argument(
+        "--gripper-threshold",
+        type=float,
+        default=50.0,
+        help="Threshold value for gripper command (default: 50.0)"
+    )
+    parser.add_argument(
+        "--calibration-dir",
+        type=str,
+        default=None,
+        help="Directory for calibration files (optional)"
+    )
 
-    # Transmission frequency
-    frequency = 100.0  # Hz
-
-    # Gripper threshold (adjust based on your gripper's range)
-    gripper_threshold = 50.0
+    args = parser.parse_args()
 
     try:
-        # Initialize bimanual teleop socket sender
-        sender = BimanualTeleopSocketSender(
-            left_arm_port=left_arm_port,
-            right_arm_port=right_arm_port,
-            socket_host=socket_host,
-            socket_port=socket_port,
-            urdf_path=urdf_path,
-            frequency=frequency,
-            gripper_threshold=gripper_threshold
+        # Initialize bimanual teleop ZeroMQ sender
+        sender = BimanualTeleopZeroMQSender(
+            left_arm_port=args.left_arm_port,
+            right_arm_port=args.right_arm_port,
+            server_ip=args.server_ip,
+            zmq_port=args.zmq_port,
+            urdf_path=args.urdf_path,
+            frequency=args.frequency,
+            calibration_dir=args.calibration_dir,
+            gripper_threshold=args.gripper_threshold
         )
         # Connect and start
         sender.connect()
