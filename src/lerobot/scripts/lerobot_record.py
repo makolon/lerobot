@@ -79,6 +79,7 @@ from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -92,6 +93,7 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    earthrover_mini_plus,
     hope_jr,
     koch_follower,
     make_robot_from_config,
@@ -117,7 +119,8 @@ from lerobot.utils.control_utils import (
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
-from lerobot.utils.robot_utils import busy_wait
+from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
@@ -315,10 +318,7 @@ def record_loop(
                 robot_type=robot.robot_type,
             )
 
-            action_names = dataset.features[ACTION]["names"]
-            act_processed_policy: RobotAction = {
-                f"{name}": float(action_values[i]) for i, name in enumerate(action_names)
-            }
+            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
@@ -365,7 +365,7 @@ def record_loop(
             log_rerun_data(observation=obs_processed, action=action_values)
 
         dt_s = time.perf_counter() - start_loop_t
-        busy_wait(1 / fps - dt_s)
+        precise_sleep(1 / fps - dt_s)
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -513,6 +513,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
 
 def main():
+    register_third_party_plugins()
     record()
 
 

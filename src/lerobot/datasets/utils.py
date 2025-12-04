@@ -28,9 +28,10 @@ import numpy as np
 import packaging.version
 import pandas
 import pandas as pd
+import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
 from huggingface_hub.errors import RevisionNotFoundError
@@ -44,11 +45,11 @@ from lerobot.datasets.backward_compatibility import (
     ForwardCompatibilityError,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
-from lerobot.utils.utils import is_valid_numpy_dtype_string
+from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
-DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500  # Max size per file
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = 200  # Max size per file
 
 INFO_PATH = "meta/info.json"
 STATS_PATH = "meta/stats.json"
@@ -94,12 +95,6 @@ def get_hf_dataset_size_in_mb(hf_ds: Dataset) -> int:
     return hf_ds.data.nbytes // (1024**2)
 
 
-def get_hf_dataset_cache_dir(hf_ds: Dataset) -> Path | None:
-    if hf_ds.cache_files is None or len(hf_ds.cache_files) == 0:
-        return None
-    return Path(hf_ds.cache_files[0]["filename"]).parents[2]
-
-
 def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -> tuple[int, int]:
     if file_idx == chunks_size - 1:
         file_idx = 0
@@ -109,7 +104,9 @@ def update_chunk_file_indices(chunk_idx: int, file_idx: int, chunks_size: int) -
     return chunk_idx, file_idx
 
 
-def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None) -> Dataset:
+def load_nested_dataset(
+    pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
+) -> Dataset:
     """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
     Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
     Concatenate all pyarrow references to return HF Dataset format
@@ -117,14 +114,26 @@ def load_nested_dataset(pq_dir: Path, features: datasets.Features | None = None)
     Args:
         pq_dir: Directory containing parquet files
         features: Optional features schema to ensure consistent loading of complex types like images
+        episodes: Optional list of episode indices to filter. Uses PyArrow predicate pushdown for efficiency.
     """
     paths = sorted(pq_dir.glob("*/*.parquet"))
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
 
-    # TODO(rcadene): set num_proc to accelerate conversion to pyarrow
-    datasets = [Dataset.from_parquet(str(path), features=features) for path in paths]
-    return concatenate_datasets(datasets)
+    with SuppressProgressBars():
+        # When no filtering needed, Dataset uses memory-mapped loading for efficiency
+        # PyArrow loads the entire dataset into memory
+        if episodes is None:
+            return Dataset.from_parquet([str(path) for path in paths], features=features)
+
+        arrow_dataset = pa_ds.dataset(paths, format="parquet")
+        filter_expr = pa_ds.field("episode_index").isin(episodes)
+        table = arrow_dataset.to_table(filter=filter_expr)
+
+        if features is not None:
+            table = table.cast(features.arrow_schema)
+
+        return Dataset(table)
 
 
 def get_parquet_num_frames(parquet_path: str | Path) -> int:
@@ -132,10 +141,14 @@ def get_parquet_num_frames(parquet_path: str | Path) -> int:
     return metadata.num_rows
 
 
-def get_video_size_in_mb(mp4_path: Path) -> float:
-    file_size_bytes = mp4_path.stat().st_size
-    file_size_mb = file_size_bytes / (1024**2)
-    return file_size_mb
+def get_file_size_in_mb(file_path: Path) -> float:
+    """Get file size on disk in megabytes.
+
+    Args:
+        file_path (Path): Path to the file.
+    """
+    file_size_bytes = file_path.stat().st_size
+    return file_size_bytes / (1024**2)
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
