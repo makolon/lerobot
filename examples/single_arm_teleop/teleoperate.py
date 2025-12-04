@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
-from lerobot.teleoperators.bi_so100_leader.bi_so100_leader import BiSO100Leader
-from lerobot.teleoperators.bi_so100_leader.config_bi_so100_leader import BiSO100LeaderConfig
+from lerobot.teleoperators.so100_leader.so100_leader import SO100Leader
+from lerobot.teleoperators.so100_leader.config_so100_leader import SO100LeaderConfig
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.rotation import Rotation
 
@@ -22,13 +22,12 @@ class PoseData:
     timestamp: float
 
 
-class BimanualTeleopSocketSender:
-    """Sends bimanual SO100 leader End Effector poses via socket at high frequency"""
+class SingleArmTeleopSocketSender:
+    """Sends single arm SO100 leader End Effector poses via socket at high frequency"""
 
     def __init__(
         self,
-        left_arm_port: str,
-        right_arm_port: str,
+        arm_port: str,
         socket_host: str = "localhost",
         socket_port: int = 12345,
         urdf_path: str = "./SO101/so101_new_calib.urdf",
@@ -37,11 +36,10 @@ class BimanualTeleopSocketSender:
         gripper_threshold: float = 30.0,
     ):
         """
-        Initialize the bimanual teleop socket sender
+        Initialize the single arm teleop socket sender
 
         Args:
-            left_arm_port: Serial port for left SO100 leader arm
-            right_arm_port: Serial port for right SO100 leader arm
+            arm_port: Serial port for SO100 leader arm
             socket_host: Host address for socket connection
             socket_port: Port for socket connection
             urdf_path: Path to the robot URDF file
@@ -54,32 +52,23 @@ class BimanualTeleopSocketSender:
         self.socket_port = socket_port
         self.gripper_threshold = gripper_threshold
 
-        # Initialize bimanual leader configuration
-        self.teleop_config = BiSO100LeaderConfig(
-            left_arm_port=left_arm_port,
-            right_arm_port=right_arm_port,
+        # Initialize single arm leader configuration
+        self.teleop_config = SO100LeaderConfig(
+            arm_port=arm_port,
             calibration_dir=calibration_dir,
-            id="bimanual_leader"
+            id="single_arm_leader"
         )
 
-        # Initialize bimanual leader
-        self.teleop = BiSO100Leader(self.teleop_config)
+        # Initialize single arm leader
+        self.teleop = SO100Leader(self.teleop_config)
 
-        # Initialize kinematics solvers for both arms
-        # Exclude gripper from joint names for kinematics
-        left_joint_names = [name for name in self.teleop.left_arm.bus.motors if name != "gripper"]
-        right_joint_names = [name for name in self.teleop.right_arm.bus.motors if name != "gripper"]
+        # Initialize kinematics solvers for the arm
+        arm_joint_names = [name for name in self.teleop.arm.bus.motors if name != "gripper"]
 
-        self.left_kinematics = RobotKinematics(
+        self.arm_kinematics = RobotKinematics(
             urdf_path=urdf_path,
             target_frame_name="gripper_frame_link",
-            joint_names=left_joint_names,
-        )
-
-        self.right_kinematics = RobotKinematics(
-            urdf_path=urdf_path,
-            target_frame_name="gripper_frame_link",
-            joint_names=right_joint_names,
+            joint_names=arm_joint_names,
         )
 
         # Socket connection
@@ -88,13 +77,12 @@ class BimanualTeleopSocketSender:
 
     def connect(self):
         """Connect to the teleoperator and setup socket server"""
-        print("Connecting to bimanual SO100 leader...")
+        print("Connecting to single arm SO100 leader...")
         self.teleop.connect()
 
         if not self.teleop.is_connected:
-            raise RuntimeError("Failed to connect to bimanual leader arms")
-
-        print("Connected to bimanual SO100 leader")
+            raise RuntimeError("Failed to connect to single arm leader arm")
+        print("Connected to single arm SO100 leader")
 
         # Setup socket server
         self.setup_socket_server()
@@ -125,109 +113,72 @@ class BimanualTeleopSocketSender:
         action_dict = self.teleop.get_action()
 
         # Get joint names (excluding gripper) in the same order as kinematics
-        left_joint_names = [name for name in self.teleop.left_arm.bus.motors if name != "gripper"]
-        right_joint_names = [name for name in self.teleop.right_arm.bus.motors if name != "gripper"]
+        arm_joint_names = [name for name in self.teleop.arm.bus.motors if name != "gripper"]
 
         # Extract joint positions for left arm in correct order
-        left_joints = []
-        left_gripper = None
-        for motor_name in left_joint_names:
-            key = f"left_{motor_name}.pos"
+        arm_joints = []
+        gripper = None
+        for motor_name in arm_joint_names:
+            key = f"arm_{motor_name}.pos"
             if key in action_dict:
-                left_joints.append(action_dict[key])
+                arm_joints.append(action_dict[key])
 
-        # Get left gripper
-        left_gripper_key = "left_gripper.pos"
-        if left_gripper_key in action_dict:
-            left_gripper = action_dict[left_gripper_key]
+        # Get gripper
+        gripper_key = "arm_gripper.pos"
+        if gripper_key in action_dict:
+            gripper = action_dict[gripper_key]
 
-        # Extract joint positions for right arm in correct order
-        right_joints = []
-        right_gripper = None
-        for motor_name in right_joint_names:
-            key = f"right_{motor_name}.pos"
-            if key in action_dict:
-                right_joints.append(action_dict[key])
+        return np.array(arm_joints), gripper
 
-        # Get right gripper
-        right_gripper_key = "right_gripper.pos"
-        if right_gripper_key in action_dict:
-            right_gripper = action_dict[right_gripper_key]
-
-        return np.array(left_joints), np.array(right_joints), left_gripper, right_gripper
-
-    def compute_end_effector_poses(self, left_joints, right_joints, left_gripper, right_gripper):
+    def compute_end_effector_poses(self, arm_joints, gripper):
         """Compute end effector poses from joint positions and process gripper commands"""
-        if self.left_kinematics is None or self.right_kinematics is None:
-            return None, None
+        if self.arm_kinematics is None:
+            return None
 
         try:
             # Ensure joint arrays have correct size
-            if left_joints.size == 0 or right_joints.size == 0:
+            if arm_joints.size == 0:
                 print("Warning: Empty joint arrays received")
                 return None, None
 
-            # Compute forward kinematics for both arms
-            left_transform = self.left_kinematics.forward_kinematics(left_joints)
-            right_transform = self.right_kinematics.forward_kinematics(right_joints)
+            # Compute forward kinematics for arm
+            ee_transform = self.arm_kinematics.forward_kinematics(arm_joints)
         except Exception as e:
             print(f"Error in forward kinematics: {e}")
-            print(f"Left joints size: {left_joints.size}, Right joints size: {right_joints.size}")
+            print(f"Arm joints size: {arm_joints.size}")
             return None, None
 
         # Process gripper commands using threshold
-        left_gripper_cmd = 1.0 if left_gripper is not None and left_gripper >= self.gripper_threshold else 0.0
-        right_gripper_cmd = 1.0 if right_gripper is not None and right_gripper >= self.gripper_threshold else 0.0
+        gripper_cmd = 1.0 if gripper is not None and gripper >= self.gripper_threshold else 0.0
 
         # Extract position and orientation
-        left_pose = PoseData(
-            position=left_transform[:3, 3],
-            orientation=Rotation.from_matrix(left_transform[:3, :3]).as_quat(),
-            gripper_command=left_gripper_cmd,
+        ee_pose = PoseData(
+            position=ee_transform[:3, 3],
+            orientation=Rotation.from_matrix(ee_transform[:3, :3]).as_quat(),
+            gripper_command=gripper_cmd,
             timestamp=time.time()
         )
 
-        right_pose = PoseData(
-            position=right_transform[:3, 3],
-            orientation=Rotation.from_matrix(right_transform[:3, :3]).as_quat(),
-            gripper_command=right_gripper_cmd,
-            timestamp=time.time()
-        )
+        return ee_pose
 
-        return left_pose, right_pose
-
-    def create_pose_message(self, left_pose, right_pose):
-        """Create JSON message with both arm poses and gripper commands"""
+    def create_pose_message(self, arm_pose):
+        """Create JSON message with arm pose and gripper command"""
         message = {
             "timestamp": time.time(),
-            "left_arm": {
+            "arm": {
                 "position": {
-                    "px": float(left_pose.position[0]),
-                    "py": float(left_pose.position[1]),
-                    "pz": float(left_pose.position[2])
+                    "px": float(arm_pose.position[0]),
+                    "py": float(arm_pose.position[1]),
+                    "pz": float(arm_pose.position[2])
                 },
                 "orientation": {
-                    "qx": float(left_pose.orientation[0]),
-                    "qy": float(left_pose.orientation[1]),
-                    "qz": float(left_pose.orientation[2]),
-                    "qw": float(left_pose.orientation[3])
+                    "qx": float(arm_pose.orientation[0]),
+                    "qy": float(arm_pose.orientation[1]),
+                    "qz": float(arm_pose.orientation[2]),
+                    "qw": float(arm_pose.orientation[3])
                 },
-                "gripper": float(left_pose.gripper_command)
+                "gripper": float(arm_pose.gripper_command)
             },
-            "right_arm": {
-                "position": {
-                    "px": float(right_pose.position[0]),
-                    "py": float(right_pose.position[1]),
-                    "pz": float(right_pose.position[2])
-                },
-                "orientation": {
-                    "qx": float(right_pose.orientation[0]),
-                    "qy": float(right_pose.orientation[1]),
-                    "qz": float(right_pose.orientation[2]),
-                    "qw": float(right_pose.orientation[3])
-                },
-                "gripper": float(right_pose.gripper_command)
-            }
         }
         return json.dumps(message) + "\n"
 
@@ -250,7 +201,7 @@ class BimanualTeleopSocketSender:
 
     def run_teleop_loop(self):
         """Main teleoperation loop"""
-        print(f"Starting bimanual teleop loop at {self.frequency} Hz...")
+        print(f"Starting single arm teleop loop at {self.frequency} Hz...")
         print("Waiting for client connections...")
 
         loop_duration = 1.0 / self.frequency
@@ -262,29 +213,27 @@ class BimanualTeleopSocketSender:
                 # Accept new client connections
                 self.accept_new_clients()
 
-                # Get joint positions and gripper commands from both arms
-                left_joints, right_joints, left_gripper, right_gripper = self.get_joint_positions_and_gripper()
+                # Get joint positions and gripper commands from arm
+                arm_joints, gripper = self.get_joint_positions_and_gripper()
 
                 # Debug: Print joint array sizes occasionally
                 if int(time.time() * 10) % 50 == 0:  # Print every 5 seconds
-                    print(f"Debug: Left joints shape: {left_joints.shape}, Right joints shape: {right_joints.shape}")
-                    print(f"Debug: Left gripper: {left_gripper}, Right gripper: {right_gripper}")
+                    print(f"Debug: Arm joints shape: {arm_joints.shape}")
+                    print(f"Debug: Gripper: {gripper}")
 
-                if left_joints.size > 0 and right_joints.size > 0:
+                if arm_joints.size > 0:
                     # Compute end effector poses with gripper commands
-                    left_pose, right_pose = self.compute_end_effector_poses(left_joints, right_joints, left_gripper, right_gripper)
+                    arm_pose = self.compute_end_effector_poses(arm_joints, gripper)
 
-                    if left_pose is not None and right_pose is not None:
+                    if arm_pose is not None:
                         # Create and send message
-                        message = self.create_pose_message(left_pose, right_pose)
-
+                        message = self.create_pose_message(arm_pose)
                         if self.connected_clients:
                             self.send_to_clients(message)
 
                         # Debug output (reduce frequency for readability)
                         if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
-                            print(f"Left - Pos: {left_pose.position}, Rot: {left_pose.orientation}, Gripper: {left_pose.gripper_command}")
-                            print(f"Right - Pos: {right_pose.position}, Rot: {right_pose.orientation}, Gripper: {right_pose.gripper_command}")
+                            print(f"Arm - Pos: {arm_pose.position}, Rot: {arm_pose.orientation}, Gripper: {arm_pose.gripper_command}")
 
             except KeyboardInterrupt:
                 print("\nShutting down...")
@@ -314,11 +263,10 @@ class BimanualTeleopSocketSender:
 
 
 def main():
-    """Main function to run the bimanual teleop socket sender"""
+    """Main function to run the single arm teleop socket sender"""
 
-    # Configuration - Update these ports according to your setup
-    left_arm_port = "/dev/tty.usbmodem5A7A0178511"  # Update with your left arm port
-    right_arm_port = "/dev/tty.usbmodem5A7A0181491"  # Update with your right arm port
+    # Configuration - Update this port according to your setup
+    arm_port = "/dev/tty.usbmodem5A7A0178511"
 
     # Socket configuration
     socket_host = "localhost"
@@ -334,10 +282,9 @@ def main():
     gripper_threshold = 50.0
 
     try:
-        # Initialize bimanual teleop socket sender
-        sender = BimanualTeleopSocketSender(
-            left_arm_port=left_arm_port,
-            right_arm_port=right_arm_port,
+        # Initialize single arm teleop socket sender
+        sender = SO100LeaderConfig(
+            arm_port=arm_port,
             socket_host=socket_host,
             socket_port=socket_port,
             urdf_path=urdf_path,
