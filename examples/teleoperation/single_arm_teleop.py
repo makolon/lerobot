@@ -9,7 +9,7 @@ import numpy as np
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.teleoperators.so100_leader.so100_leader import SO100Leader
 from lerobot.teleoperators.so100_leader.config_so100_leader import SO100LeaderConfig
-from lerobot.utils.robot_utils import busy_wait
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
 
 
@@ -27,7 +27,7 @@ class SingleArmTeleopSocketSender:
 
     def __init__(
         self,
-        arm_port: str,
+        port: str,
         socket_host: str = "localhost",
         socket_port: int = 12345,
         urdf_path: str = "src/lerobot/assets/so101/so101_new_calib.urdf",
@@ -38,7 +38,7 @@ class SingleArmTeleopSocketSender:
         Initialize the single arm teleop socket sender
 
         Args:
-            arm_port: Serial port for SO100 leader arm
+            port: Serial port for SO100 leader arm
             socket_host: Host address for socket connection
             socket_port: Port for socket connection
             urdf_path: Path to the robot URDF file
@@ -51,7 +51,7 @@ class SingleArmTeleopSocketSender:
 
         # Initialize single arm leader configuration
         self.teleop_config = SO100LeaderConfig(
-            arm_port=arm_port,
+            port=port,
             calibration_dir=calibration_dir,
             id="single_arm_leader"
         )
@@ -60,7 +60,8 @@ class SingleArmTeleopSocketSender:
         self.teleop = SO100Leader(self.teleop_config)
 
         # Initialize kinematics solvers for the arm
-        self.arm_joint_names = list(self.teleop.arm.bus.motors)
+        self.arm_joint_names = list(self.teleop.bus.motors)
+        print("Arm joint names:", self.arm_joint_names)
 
         self.arm_kinematics = RobotKinematics(
             urdf_path=urdf_path,
@@ -106,15 +107,17 @@ class SingleArmTeleopSocketSender:
             print(f"Error accepting client: {e}")
 
     def get_joint_positions(self):
-        """Get current joint positions and gripper commands from both arms"""
+        """Get current joint positions from the arm"""
         action_dict = self.teleop.get_action()
 
         # Extract joint positions for arm in correct order
         arm_joints = []
         for motor_name in self.arm_joint_names:
-            key = f"arm_{motor_name}.pos"
+            key = f"{motor_name}.pos"
             if key in action_dict:
                 arm_joints.append(action_dict[key])
+            else:
+                print(f"Warning: Key '{key}' not found in action_dict")
 
         return np.array(arm_joints)
 
@@ -231,7 +234,7 @@ class SingleArmTeleopSocketSender:
 
             # Maintain loop frequency
             elapsed = time.perf_counter() - loop_start
-            busy_wait(max(loop_duration - elapsed, 0.0))
+            precise_sleep(max(loop_duration - elapsed, 0.0))
 
     def disconnect(self):
         """Disconnect from devices and close socket"""
@@ -254,7 +257,7 @@ def main():
     """Main function to run the single arm teleop socket sender"""
 
     # Configuration - Update this port according to your setup
-    arm_port = "/dev/tty.usbmodem5A7A0178511"
+    port = "/dev/tty.usbmodem5A7A0181491"
 
     # Socket configuration
     socket_host = "localhost"
@@ -269,7 +272,7 @@ def main():
     try:
         # Initialize single arm teleop socket sender
         sender = SingleArmTeleopSocketSender(
-            arm_port=arm_port,
+            port=port,
             socket_host=socket_host,
             socket_port=socket_port,
             urdf_path=urdf_path,

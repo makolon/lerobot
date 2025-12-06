@@ -9,7 +9,7 @@ import numpy as np
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.teleoperators.bi_so100_leader.bi_so100_leader import BiSO100Leader
 from lerobot.teleoperators.bi_so100_leader.config_bi_so100_leader import BiSO100LeaderConfig
-from lerobot.utils.robot_utils import busy_wait
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
 
 
@@ -294,7 +294,7 @@ class DualArmTeleopSocketSender:
 
             # Maintain loop frequency
             elapsed = time.perf_counter() - loop_start
-            busy_wait(max(loop_duration - elapsed, 0.0))
+            precise_sleep(max(loop_duration - elapsed, 0.0))
 
     def disconnect(self):
         """Disconnect from devices and close socket"""
