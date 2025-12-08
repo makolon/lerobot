@@ -3,6 +3,7 @@ import json
 import socket
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -11,6 +12,9 @@ from lerobot.teleoperators.so100_leader.so100_leader import SO100Leader
 from lerobot.teleoperators.so100_leader.config_so100_leader import SO100LeaderConfig
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
+
+# Get the lerobot package directory
+LEROBOT_ROOT = Path(__file__).parent.parent.parent / "src" / "lerobot"
 
 
 @dataclass
@@ -63,8 +67,20 @@ class SingleArmTeleopSocketSender:
         self.arm_joint_names = list(self.teleop.bus.motors)
         print("Arm joint names:", self.arm_joint_names)
 
+        # Resolve URDF path to absolute path
+        # Support both absolute paths and relative paths from lerobot assets
+        urdf_path_obj = Path(urdf_path)
+        if urdf_path_obj.is_absolute():
+            urdf_path_resolved = str(urdf_path_obj)
+        else:
+            urdf_path_resolved = str(LEROBOT_ROOT / "assets" / urdf_path)
+
+        if not Path(urdf_path_resolved).exists():
+            raise FileNotFoundError(f"URDF file not found: {urdf_path_resolved}")
+        print(f"Loading URDF from: {urdf_path_resolved}")
+
         self.arm_kinematics = RobotKinematics(
-            urdf_path=urdf_path,
+            urdf_path=urdf_path_resolved,
             target_frame_name="gripper_frame_link",
             joint_names=self.arm_joint_names,
         )
@@ -263,8 +279,8 @@ def main():
     socket_host = "localhost"
     socket_port = 12345
 
-    # URDF path - Download from https://github.com/TheRobotStudio/SO-ARM100
-    urdf_path = "src/lerobot/assets/so101/so101_new_calib.urdf"
+    # URDF path - relative to lerobot/assets or absolute path
+    urdf_path = "so101/so101_new_calib.urdf"
 
     # Transmission frequency
     frequency = 100.0  # Hz
