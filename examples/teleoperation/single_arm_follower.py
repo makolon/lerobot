@@ -1,26 +1,10 @@
-#!/usr/bin/env python
-"""
-Single Arm Follower - Receives joint positions from Leader via socket and controls follower arm.
-
-This script connects to single_arm_teleop.py (Leader) and replicates the joint positions
-on a follower SO100 robot arm.
-
-Usage:
-    1. First, start the Leader:
-       python examples/teleoperation/single_arm_teleop.py
-
-    2. Then, start this Follower:
-       python examples/teleoperation/single_arm_follower.py
-"""
-
-import argparse
 import json
 import socket
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
-import numpy as np
-
+from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so100_follower.so100_follower import SO100Follower
 from lerobot.robots.so100_follower.config_so100_follower import SO100FollowerConfig
 from lerobot.utils.robot_utils import precise_sleep
@@ -42,6 +26,7 @@ class SingleArmFollower:
         port: str,
         socket_host: str = "localhost",
         socket_port: int = 12345,
+        urdf_path: str = "src/lerobot/assets/so101/so101_new_calib.urdf",
         frequency: float = 100.0,
         calibration_dir: str = None,
     ):
@@ -52,6 +37,7 @@ class SingleArmFollower:
             port: Serial port for SO100 follower arm
             socket_host: Host address of the Leader socket server
             socket_port: Port of the Leader socket server
+            urdf_path: Path to the robot URDF file
             frequency: Control frequency in Hz
             calibration_dir: Directory for calibration files
         """
@@ -59,7 +45,7 @@ class SingleArmFollower:
         self.socket_host = socket_host
         self.socket_port = socket_port
 
-        # Initialize follower arm configuration
+        # Initialize follower arm follower configuration
         self.follower_config = SO100FollowerConfig(
             port=port,
             calibration_dir=calibration_dir,
@@ -68,6 +54,21 @@ class SingleArmFollower:
 
         # Initialize follower arm
         self.follower = SO100Follower(self.follower_config)
+
+        # Initialize kinematics solvers for the arm
+        self.follower_joint_names = list(self.follower.bus.motors)
+        print(f"Follower joint names: {self.follower_joint_names}")
+
+        # Resolve URDF path to absolute path
+        urdf_path_obj = Path(urdf_path)
+        urdf_path_resolved = str(urdf_path_obj)
+        print(f"Loading URDF from: {urdf_path_resolved}")
+
+        self.arm_kinematics = RobotKinematics(
+            urdf_path=urdf_path_resolved,
+            target_frame_name="gripper_frame_link",
+            joint_names=self.follower_joint_names,
+        )
 
         # Socket connection
         self.socket = None
@@ -91,10 +92,6 @@ class SingleArmFollower:
         if not self.follower.is_connected:
             raise RuntimeError("Failed to connect to follower arm")
         print("Connected to SO100 follower arm")
-
-        # Get follower joint names for verification
-        self.follower_joint_names = list(self.follower.bus.motors)
-        print(f"Follower joint names: {self.follower_joint_names}")
 
         # Connect to Leader socket server
         self.connect_to_leader()
@@ -164,8 +161,7 @@ class SingleArmFollower:
                         print(f"JSON decode error: {e}")
 
             return latest_state
-
-        except socket.timeout:
+        except TimeoutError:
             return None
         except Exception as e:
             print(f"Error receiving data: {e}")
@@ -177,19 +173,15 @@ class SingleArmFollower:
         if joint_state is None:
             return
 
-        try:
-            # Create action dict for follower
-            action_dict = {}
-            for joint_name, position in joint_state.joint_positions.items():
-                # Map joint name to follower action key
-                action_key = f"{joint_name}.pos"
-                action_dict[action_key] = position
+        # Create action dict for follower
+        action_dict = {}
+        for joint_name, position in joint_state.joint_positions.items():
+            # Map joint name to follower action key
+            action_key = f"{joint_name}.pos"
+            action_dict[action_key] = position
 
-            # Send action to follower
-            self.follower.send_action(action_dict)
-
-        except Exception as e:
-            print(f"Error applying joint positions: {e}")
+        # Send action to follower
+        self.follower.send_action(action_dict)
 
     def print_statistics(self):
         """Print connection and performance statistics"""
@@ -244,7 +236,6 @@ class SingleArmFollower:
                     except RuntimeError:
                         print("Reconnection failed. Exiting...")
                         break
-
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 break
@@ -288,6 +279,7 @@ def main():
             port=port,
             socket_host=socket_host,
             socket_port=socket_port,
+            urdf_path=urdf_path,
             frequency=frequency,
             calibration_dir=None,
         )
@@ -295,13 +287,10 @@ def main():
         # Connect and start
         follower.connect()
         follower.run_follower_loop()
-
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
         print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         if 'follower' in locals():
             follower.disconnect()
