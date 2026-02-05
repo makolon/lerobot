@@ -13,9 +13,6 @@ from lerobot.teleoperators.so100_leader.config_so100_leader import SO100LeaderCo
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.rotation import Rotation
 
-# Get the lerobot package directory
-LEROBOT_ROOT = Path(__file__).parent.parent.parent / "src" / "lerobot"
-
 
 @dataclass
 class PoseData:
@@ -26,7 +23,7 @@ class PoseData:
     timestamp: float
 
 
-class SingleArmTeleopSocketSender:
+class SingleArmLeader:
     """Sends single arm SO100 leader End Effector poses via socket at high frequency"""
 
     def __init__(
@@ -39,7 +36,7 @@ class SingleArmTeleopSocketSender:
         calibration_dir: str = None,
     ):
         """
-        Initialize the single arm teleop socket sender
+        Initialize the single arm leader
 
         Args:
             port: Serial port for SO100 leader arm
@@ -54,35 +51,28 @@ class SingleArmTeleopSocketSender:
         self.socket_port = socket_port
 
         # Initialize single arm leader configuration
-        self.teleop_config = SO100LeaderConfig(
+        self.leader_config = SO100LeaderConfig(
             port=port,
             calibration_dir=calibration_dir,
             id="single_arm_leader"
         )
 
         # Initialize single arm leader
-        self.teleop = SO100Leader(self.teleop_config)
+        self.leader = SO100Leader(self.leader_config)
 
         # Initialize kinematics solvers for the arm
-        self.arm_joint_names = list(self.teleop.bus.motors)
-        print("Arm joint names:", self.arm_joint_names)
+        self.leader_joint_names = list(self.leader.bus.motors)
+        print(f"Leader joint names: {self.leader_joint_names}")
 
         # Resolve URDF path to absolute path
-        # Support both absolute paths and relative paths from lerobot assets
         urdf_path_obj = Path(urdf_path)
-        if urdf_path_obj.is_absolute():
-            urdf_path_resolved = str(urdf_path_obj)
-        else:
-            urdf_path_resolved = str(LEROBOT_ROOT / "assets" / urdf_path)
-
-        if not Path(urdf_path_resolved).exists():
-            raise FileNotFoundError(f"URDF file not found: {urdf_path_resolved}")
+        urdf_path_resolved = str(urdf_path_obj)
         print(f"Loading URDF from: {urdf_path_resolved}")
 
         self.arm_kinematics = RobotKinematics(
             urdf_path=urdf_path_resolved,
             target_frame_name="gripper_frame_link",
-            joint_names=self.arm_joint_names,
+            joint_names=self.leader_joint_names,
         )
 
         # Socket connection
@@ -92,9 +82,9 @@ class SingleArmTeleopSocketSender:
     def connect(self):
         """Connect to the teleoperator and setup socket server"""
         print("Connecting to single arm SO100 leader...")
-        self.teleop.connect()
+        self.leader.connect()
 
-        if not self.teleop.is_connected:
+        if not self.leader.is_connected:
             raise RuntimeError("Failed to connect to single arm leader arm")
         print("Connected to single arm SO100 leader")
 
@@ -124,11 +114,11 @@ class SingleArmTeleopSocketSender:
 
     def get_joint_positions(self):
         """Get current joint positions from the arm"""
-        action_dict = self.teleop.get_action()
+        action_dict = self.leader.get_action()
 
         # Extract joint positions for arm in correct order
         arm_joints = []
-        for motor_name in self.arm_joint_names:
+        for motor_name in self.leader_joint_names:
             key = f"{motor_name}.pos"
             if key in action_dict:
                 arm_joints.append(action_dict[key])
@@ -142,25 +132,20 @@ class SingleArmTeleopSocketSender:
         if self.arm_kinematics is None:
             return None
 
-        try:
-            # Ensure joint arrays have correct size
-            if arm_joints.size == 0:
-                print("Warning: Empty joint arrays received")
-                return None, None
-
-            # Compute forward kinematics for arm
-            ee_transform = self.arm_kinematics.forward_kinematics(arm_joints)
-        except Exception as e:
-            print(f"Error in forward kinematics: {e}")
-            print(f"Arm joints size: {arm_joints.size}")
+        # Ensure joint arrays have correct size
+        if arm_joints.size == 0:
+            print("Warning: Empty joint arrays received")
             return None, None
+
+        # Compute forward kinematics for arm
+        ee_transform = self.arm_kinematics.forward_kinematics(arm_joints)
 
         # Extract position and orientation
         ee_pose = PoseData(
             position=ee_transform[:3, 3],
             orientation=Rotation.from_matrix(ee_transform[:3, :3]).as_quat(),
             joint_positions={
-                **{name: float(val) for name, val in zip(self.arm_joint_names, arm_joints, strict=True)},
+                **{name: float(val) for name, val in zip(self.leader_joint_names, arm_joints, strict=True)},
             },
             timestamp=time.time()
         )
@@ -207,9 +192,9 @@ class SingleArmTeleopSocketSender:
             self.connected_clients.remove(client)
             print("Client disconnected")
 
-    def run_teleop_loop(self):
-        """Main teleoperation loop"""
-        print(f"Starting single arm teleop loop at {self.frequency} Hz...")
+    def run_leader_loop(self):
+        """Main leader loop"""
+        print(f"Starting single arm leader loop at {self.frequency} Hz...")
         print("Waiting for client connections...")
 
         loop_duration = 1.0 / self.frequency
@@ -241,7 +226,6 @@ class SingleArmTeleopSocketSender:
                         # Debug output (reduce frequency for readability)
                         if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
                             print(f"Arm - Pos: {arm_pose.position}, Rot: {arm_pose.orientation}, Joints: {arm_pose.joint_positions}")
-
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 break
@@ -254,8 +238,8 @@ class SingleArmTeleopSocketSender:
 
     def disconnect(self):
         """Disconnect from devices and close socket"""
-        if self.teleop:
-            self.teleop.disconnect()
+        if self.leader:
+            self.leader.disconnect()
 
         # Close all client connections
         for client in self.connected_clients:
@@ -270,7 +254,7 @@ class SingleArmTeleopSocketSender:
 
 
 def main():
-    """Main function to run the single arm teleop socket sender"""
+    """Main function to run the single arm leader"""
 
     # Configuration - Update this port according to your setup
     port = "/dev/tty.usbmodem5A7A0181491"
@@ -286,24 +270,26 @@ def main():
     frequency = 100.0  # Hz
 
     try:
-        # Initialize single arm teleop socket sender
-        sender = SingleArmTeleopSocketSender(
+        # Initialize leader
+        leader = SingleArmLeader(
             port=port,
             socket_host=socket_host,
             socket_port=socket_port,
             urdf_path=urdf_path,
             frequency=frequency,
+            calibration_dir=None,
         )
+
         # Connect and start
-        sender.connect()
-        sender.run_teleop_loop()
+        leader.connect()
+        leader.run_leader_loop()
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        if 'sender' in locals():
-            sender.disconnect()
+        if 'leader' in locals():
+            leader.disconnect()
 
 
 if __name__ == "__main__":

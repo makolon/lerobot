@@ -22,7 +22,7 @@ class PoseData:
     timestamp: float
 
 
-class DualArmTeleopSocketSender:
+class DualArmLeader:
     """Sends dual arm SO100 leader End Effector poses via socket at high frequency"""
 
     def __init__(
@@ -37,7 +37,7 @@ class DualArmTeleopSocketSender:
         gripper_threshold: float = 30.0,
     ):
         """
-        Initialize the dual arm teleop socket sender
+        Initialize the dual arm leader
 
         Args:
             left_arm_port: Serial port for left SO100 leader arm
@@ -55,31 +55,33 @@ class DualArmTeleopSocketSender:
         self.gripper_threshold = gripper_threshold
 
         # Initialize dual arm leader configuration
-        self.teleop_config = BiSO100LeaderConfig(
+        self.leader_config = BiSO100LeaderConfig(
             left_arm_port=left_arm_port,
             right_arm_port=right_arm_port,
             calibration_dir=calibration_dir,
-            id="dual arm_leader"
+            id="dual_arm_leader"
         )
 
         # Initialize dual arm leader
-        self.teleop = BiSO100Leader(self.teleop_config)
+        self.leader = BiSO100Leader(self.leader_config)
 
         # Initialize kinematics solvers for both arms
         # Exclude gripper from joint names for kinematics
-        left_joint_names = [name for name in self.teleop.left_arm.bus.motors if name != "gripper"]
-        right_joint_names = [name for name in self.teleop.right_arm.bus.motors if name != "gripper"]
+        self.left_joint_names = [name for name in self.leader.left_arm.bus.motors if name != "gripper"]
+        self.right_joint_names = [name for name in self.leader.right_arm.bus.motors if name != "gripper"]
+        print(f"Left leader joint names: {self.left_joint_names}")
+        print(f"Right leader joint names: {self.right_joint_names}")
 
         self.left_kinematics = RobotKinematics(
             urdf_path=urdf_path,
             target_frame_name="gripper_frame_link",
-            joint_names=left_joint_names,
+            joint_names=self.left_joint_names,
         )
 
         self.right_kinematics = RobotKinematics(
             urdf_path=urdf_path,
             target_frame_name="gripper_frame_link",
-            joint_names=right_joint_names,
+            joint_names=self.right_joint_names,
         )
 
         # Socket connection
@@ -87,11 +89,11 @@ class DualArmTeleopSocketSender:
         self.connected_clients = []
 
     def connect(self):
-        """Connect to the teleoperator and setup socket server"""
+        """Connect to the leader arms and setup socket server"""
         print("Connecting to dual arm SO100 leader...")
-        self.teleop.connect()
+        self.leader.connect()
 
-        if not self.teleop.is_connected:
+        if not self.leader.is_connected:
             raise RuntimeError("Failed to connect to dual arm leader arms")
 
         print("Connected to dual arm SO100 leader")
@@ -122,16 +124,12 @@ class DualArmTeleopSocketSender:
 
     def get_joint_positions_and_gripper(self):
         """Get current joint positions and gripper commands from both arms"""
-        action_dict = self.teleop.get_action()
-
-        # Get joint names (excluding gripper) in the same order as kinematics
-        left_joint_names = [name for name in self.teleop.left_arm.bus.motors if name != "gripper"]
-        right_joint_names = [name for name in self.teleop.right_arm.bus.motors if name != "gripper"]
+        action_dict = self.leader.get_action()
 
         # Extract joint positions for left arm in correct order
         left_joints = []
         left_gripper = None
-        for motor_name in left_joint_names:
+        for motor_name in self.left_joint_names:
             key = f"left_{motor_name}.pos"
             if key in action_dict:
                 left_joints.append(action_dict[key])
@@ -144,7 +142,7 @@ class DualArmTeleopSocketSender:
         # Extract joint positions for right arm in correct order
         right_joints = []
         right_gripper = None
-        for motor_name in right_joint_names:
+        for motor_name in self.right_joint_names:
             key = f"right_{motor_name}.pos"
             if key in action_dict:
                 right_joints.append(action_dict[key])
@@ -248,9 +246,9 @@ class DualArmTeleopSocketSender:
             self.connected_clients.remove(client)
             print("Client disconnected")
 
-    def run_teleop_loop(self):
-        """Main teleoperation loop"""
-        print(f"Starting dual arm teleop loop at {self.frequency} Hz...")
+    def run_leader_loop(self):
+        """Main leader loop"""
+        print(f"Starting dual arm leader loop at {self.frequency} Hz...")
         print("Waiting for client connections...")
 
         loop_duration = 1.0 / self.frequency
@@ -297,9 +295,9 @@ class DualArmTeleopSocketSender:
             precise_sleep(max(loop_duration - elapsed, 0.0))
 
     def disconnect(self):
-        """Disconnect from devices and close socket"""
-        if self.teleop:
-            self.teleop.disconnect()
+        """Disconnect from leader arms and close socket"""
+        if self.leader:
+            self.leader.disconnect()
 
         # Close all client connections
         for client in self.connected_clients:
@@ -334,8 +332,8 @@ def main():
     gripper_threshold = 50.0
 
     try:
-        # Initialize dual arm teleop socket sender
-        sender = DualArmTeleopSocketSender(
+        # Initialize dual arm leader
+        leader = DualArmLeader(
             left_arm_port=left_arm_port,
             right_arm_port=right_arm_port,
             socket_host=socket_host,
@@ -345,15 +343,15 @@ def main():
             gripper_threshold=gripper_threshold
         )
         # Connect and start
-        sender.connect()
-        sender.run_teleop_loop()
+        leader.connect()
+        leader.run_leader_loop()
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        if 'sender' in locals():
-            sender.disconnect()
+        if 'leader' in locals():
+            leader.disconnect()
 
 
 if __name__ == "__main__":
