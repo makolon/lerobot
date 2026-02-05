@@ -174,7 +174,7 @@ def main():
     # Configuration
     socket_host = "localhost"
     socket_port = 12346 # Different port from teleop
-    fps = 30
+    fps = 6
 
     # Camera settings
     # Use the camera index found via `lerobot-find-cameras opencv`
