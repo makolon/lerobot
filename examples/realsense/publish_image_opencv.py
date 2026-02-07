@@ -1,37 +1,40 @@
+#!/usr/bin/env python3
+"""
+OpenCV RGB socket sender.
+
+This script captures frames from an OpenCV camera and streams them as
+base64-encoded JPEG over a TCP socket.
+"""
+
+import argparse
+import base64
 import contextlib
 import json
+import logging
 import socket
 import time
-import base64
-import cv2
-from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 
+import cv2
+
+from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
 from lerobot.utils.robot_utils import precise_sleep
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger(__name__)
 
 
 class OpenCVImageSender:
-    """Sends OpenCV camera images via socket at a specified frequency"""
+    """Sends OpenCV RGB frames via socket."""
 
     def __init__(
         self,
         socket_host: str = "localhost",
         socket_port: int = 12346,
         camera_index: int = 0,
-        fps: int = 30,
+        fps: int = 10,
         width: int = 640,
         height: int = 480,
     ):
-        """
-        Initialize the image sender
-
-        Args:
-            socket_host: Host address for socket connection
-            socket_port: Port for socket connection
-            camera_index: Index of the OpenCV camera
-            fps: Frames per second
-            width: Image width
-            height: Image height
-        """
         self.fps = fps
         self.socket_host = socket_host
         self.socket_port = socket_port
@@ -45,157 +48,136 @@ class OpenCVImageSender:
 
         self.camera = OpenCVCamera(self.camera_config)
 
-        # Socket connection
-        self.socket = None
-        self.connected_clients = []
+        self.socket: socket.socket | None = None
+        self.connected_clients: list[socket.socket] = []
 
     def connect(self):
-        """Connect to the camera and setup socket server"""
-        print("Connecting to OpenCV camera...")
+        log.info("Connecting to OpenCV camera...")
         self.camera.connect()
-        print("Connected to OpenCV camera")
+        log.info("Connected to OpenCV camera")
 
-        # Setup socket server
         self.setup_socket_server()
 
     def setup_socket_server(self):
-        """Setup TCP socket server for image transmission"""
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.socket_host, self.socket_port))
         self.socket.listen(5)
-        self.socket.settimeout(0.001)  # Non-blocking with short timeout
-        print(f"Socket server listening on {self.socket_host}:{self.socket_port}")
+        self.socket.settimeout(0.001)
+        log.info("Socket server listening on %s:%s", self.socket_host, self.socket_port)
 
     def accept_new_clients(self):
-        """Accept new client connections (non-blocking)"""
+        if self.socket is None:
+            return
         try:
             client_socket, address = self.socket.accept()
-            client_socket.settimeout(0.001)  # Non-blocking
+            client_socket.settimeout(0.001)
             self.connected_clients.append(client_socket)
-            print(f"New client connected from {address}")
+            log.info("New client connected from %s", address)
         except TimeoutError:
-            pass  # No new connections
-        except Exception as e:
-            print(f"Error accepting client: {e}")
+            pass
+        except Exception as exc:
+            log.warning("Error accepting client: %s", exc)
+
+    def read_frame(self):
+        return self.camera.read()
 
     def create_image_message(self, image):
-        """Create JSON message with base64 encoded image"""
-        # Encode image to JPEG
-        ret, buffer = cv2.imencode('.jpg', image)
+        ret, buffer = cv2.imencode(".jpg", image)
         if not ret:
             return None
-
-        # Convert to base64
-        jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+        jpg_as_text = base64.b64encode(buffer).decode("utf-8")
 
         message = {
             "timestamp": time.time(),
             "image": jpg_as_text,
             "format": "jpeg",
-            "shape": image.shape
+            "shape": image.shape,
+            "has_depth": False,
         }
+
         return json.dumps(message) + "\n"
 
     def send_to_clients(self, message):
-        """Send message to all connected clients"""
         disconnected_clients = []
-
         for client in self.connected_clients:
             try:
-                client.send(message.encode('utf-8'))
+                client.send(message.encode("utf-8"))
             except (OSError, BrokenPipeError):
                 disconnected_clients.append(client)
 
-        # Remove disconnected clients
         for client in disconnected_clients:
             with contextlib.suppress(Exception):
                 client.close()
             self.connected_clients.remove(client)
-            print("Client disconnected")
+            log.info("Client disconnected")
 
     def run_loop(self):
-        """Main loop"""
-        print(f"Starting image sender loop at {self.fps} Hz...")
-        print("Waiting for client connections...")
+        log.info("Starting image sender loop at %s Hz...", self.fps)
+        log.info("Waiting for client connections...")
 
         loop_duration = 1.0 / self.fps
 
         while True:
             loop_start = time.perf_counter()
-
             try:
-                # Accept new client connections
                 self.accept_new_clients()
 
-                # Capture frame
-                image = self.camera.read()
-
+                image = self.read_frame()
                 if image is not None:
-                    # Create and send message
                     message = self.create_image_message(image)
                     if message and self.connected_clients:
                         self.send_to_clients(message)
-
-                        # Debug output
-                        if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
-                            print(f"Sent image: {image.shape} at {time.time():.2f}")
-
             except KeyboardInterrupt:
-                print("\nShutting down...")
+                log.info("Shutting down...")
                 break
-            except Exception as e:
-                print(f"Error in main loop: {e}")
+            except Exception as exc:
+                log.error("Error in main loop: %s", exc)
 
-            # Maintain loop frequency
             elapsed = time.perf_counter() - loop_start
             precise_sleep(max(loop_duration - elapsed, 0.0))
 
     def disconnect(self):
-        """Disconnect from devices and close socket"""
         if self.camera:
             self.camera.disconnect()
-
-        # Close all client connections
         for client in self.connected_clients:
             with contextlib.suppress(Exception):
                 client.close()
-
-        # Close server socket
         if self.socket:
             self.socket.close()
-
-        print("Disconnected successfully")
+        log.info("Disconnected successfully")
 
 
 def main():
-    """Main function to run the image sender"""
+    parser = argparse.ArgumentParser(
+        description="Send OpenCV RGB frames over a socket",
+    )
+    parser.add_argument("--socket-host", type=str, default="localhost", help="Socket host (default: localhost)")
+    parser.add_argument("--socket-port", type=int, default=12346, help="Socket port (default: 12346)")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index (default: 0)")
+    parser.add_argument("--fps", type=int, default=30, help="Frames per second (default: 30)")
+    parser.add_argument("--width", type=int, default=640, help="Frame width (default: 640)")
+    parser.add_argument("--height", type=int, default=480, help="Frame height (default: 480)")
+    args = parser.parse_args()
 
-    # Configuration
-    socket_host = "localhost"
-    socket_port = 12346 # Different port from teleop
-    fps = 6
-
-    # Camera settings
-    # Use the camera index found via `lerobot-find-cameras opencv`
-    # In your case, Camera #0 or Camera #1
-    camera_index = 0
-
+    sender = None
     try:
         sender = OpenCVImageSender(
-            socket_host=socket_host,
-            socket_port=socket_port,
-            camera_index=camera_index,
-            fps=fps
+            socket_host=args.socket_host,
+            socket_port=args.socket_port,
+            camera_index=args.camera_index,
+            fps=args.fps,
+            width=args.width,
+            height=args.height,
         )
         sender.connect()
         sender.run_loop()
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    except Exception as e:
-        print(f"Error: {e}")
+        log.info("Interrupted by user")
+    except Exception as exc:
+        log.error("Error: %s", exc)
     finally:
-        if 'sender' in locals():
+        if sender is not None:
             sender.disconnect()
 
 
