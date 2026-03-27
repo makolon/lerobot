@@ -4,18 +4,30 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import lerobot
+import numpy as np
+
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.robots.so100_follower.so100_follower import SO100Follower
 from lerobot.robots.so100_follower.config_so100_follower import SO100FollowerConfig
 from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.rotation import Rotation
 
 
 @dataclass
-class ReceivedJointState:
+class JointData:
     """Structure to hold received joint state data"""
     joint_positions: dict  # Joint name to position mapping
     timestamp: float
     receive_time: float
+
+
+@dataclass
+class PoseData:
+    """Structure to hold pose data with position and orientation"""
+    position: np.ndarray  # [x, y, z]
+    orientation: np.ndarray  # [qx, qy, qz, qw]
+    timestamp: float
 
 
 class SingleArmFollower:
@@ -26,7 +38,6 @@ class SingleArmFollower:
         port: str,
         socket_host: str = "localhost",
         socket_port: int = 12345,
-        urdf_path: str = "src/lerobot/assets/so101/so101_new_calib.urdf",
         frequency: float = 100.0,
         calibration_dir: str = None,
     ):
@@ -37,13 +48,19 @@ class SingleArmFollower:
             port: Serial port for SO100 follower arm
             socket_host: Host address of the Leader socket server
             socket_port: Port of the Leader socket server
-            urdf_path: Path to the robot URDF file
             frequency: Control frequency in Hz
             calibration_dir: Directory for calibration files
         """
         self.frequency = frequency
         self.socket_host = socket_host
         self.socket_port = socket_port
+
+        # Resolve URDF path with a packaged default when none is provided
+        base_dir = Path(lerobot.__file__).resolve().parent
+        resolved_urdf_path = base_dir / "assets" / "so101" / "robot.urdf"
+
+        if not resolved_urdf_path.exists():
+            raise FileNotFoundError(f"URDF file not found: {resolved_urdf_path}")
 
         # Initialize follower arm follower configuration
         self.follower_config = SO100FollowerConfig(
@@ -55,17 +72,13 @@ class SingleArmFollower:
         # Initialize follower arm
         self.follower = SO100Follower(self.follower_config)
 
-        # Initialize kinematics solvers for the arm
+        # Get joint names from follower
         self.follower_joint_names = list(self.follower.bus.motors)
         print(f"Follower joint names: {self.follower_joint_names}")
 
-        # Resolve URDF path to absolute path
-        urdf_path_obj = Path(urdf_path)
-        urdf_path_resolved = str(urdf_path_obj)
-        print(f"Loading URDF from: {urdf_path_resolved}")
-
+        # Initialize kinematics solver
         self.arm_kinematics = RobotKinematics(
-            urdf_path=urdf_path_resolved,
+            urdf_path=str(resolved_urdf_path),
             target_frame_name="gripper_frame_link",
             joint_names=self.follower_joint_names,
         )
@@ -77,12 +90,9 @@ class SingleArmFollower:
         # Buffer for incomplete messages
         self.receive_buffer = ""
 
-        # Latest received joint state
-        self.latest_joint_state: ReceivedJointState | None = None
-
-        # Statistics
-        self.message_count = 0
-        self.last_stats_time = time.time()
+        # Latest received joint state and computed pose
+        self.latest_joint_state: JointData | None = None
+        self.latest_pose: PoseData | None = None
 
     def connect(self):
         """Connect to the follower arm and Leader socket server"""
@@ -121,7 +131,7 @@ class SingleArmFollower:
 
         raise RuntimeError(f"Failed to connect to Leader after {max_retries} attempts")
 
-    def receive_joint_state(self) -> ReceivedJointState | None:
+    def receive_joint_state(self) -> JointData | None:
         """Receive joint state from Leader (non-blocking)"""
         if not self.connected:
             return None
@@ -147,19 +157,17 @@ class SingleArmFollower:
                 if msg.strip():
                     try:
                         pose_data = json.loads(msg)
-                        self.message_count += 1
 
                         # Extract joint positions from the "joints" field
                         if "joints" in pose_data and "arm" in pose_data["joints"]:
                             joint_positions = pose_data["joints"]["arm"]
-                            latest_state = ReceivedJointState(
+                            latest_state = JointData(
                                 joint_positions=joint_positions,
                                 timestamp=pose_data.get("timestamp", time.time()),
                                 receive_time=receive_time
                             )
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error: {e}")
-
             return latest_state
         except TimeoutError:
             return None
@@ -168,7 +176,7 @@ class SingleArmFollower:
             self.connected = False
             return None
 
-    def apply_joint_positions(self, joint_state: ReceivedJointState):
+    def apply_joint_positions(self, joint_state: JointData):
         """Apply received joint positions to the follower arm"""
         if joint_state is None:
             return
@@ -183,24 +191,33 @@ class SingleArmFollower:
         # Send action to follower
         self.follower.send_action(action_dict)
 
-    def print_statistics(self):
-        """Print connection and performance statistics"""
-        current_time = time.time()
-        elapsed = current_time - self.last_stats_time
+    def compute_end_effector_pose(self, joint_state: JointData) -> PoseData | None:
+        """Compute end effector pose from joint positions using forward kinematics"""
+        if self.arm_kinematics is None or joint_state is None:
+            return None
 
-        if elapsed >= 5.0:  # Print every 5 seconds
-            rate = self.message_count / elapsed
-            print("\n=== Statistics ===")
-            print(f"Messages received: {self.message_count} ({rate:.1f} Hz)")
+        # Convert joint_positions dict to array in correct order
+        arm_joints = np.array([
+            joint_state.joint_positions[name]
+            for name in self.follower_joint_names
+        ])
 
-            if self.latest_joint_state is not None:
-                latency = (self.latest_joint_state.receive_time -
-                          self.latest_joint_state.timestamp) * 1000
-                print(f"Latency: {latency:.2f} ms")
-                print(f"Latest joints: {self.latest_joint_state.joint_positions}")
+        # Ensure joint arrays have correct size
+        if arm_joints.size == 0:
+            print("Warning: Empty joint arrays")
+            return None
 
-            self.message_count = 0
-            self.last_stats_time = current_time
+        # Compute forward kinematics
+        ee_transform = self.arm_kinematics.forward_kinematics(arm_joints)
+
+        # Extract position and orientation
+        ee_pose = PoseData(
+            position=ee_transform[:3, 3],
+            orientation=Rotation.from_matrix(ee_transform[:3, :3]).as_quat(),
+            timestamp=time.time()
+        )
+
+        return ee_pose
 
     def run_follower_loop(self):
         """Main follower control loop"""
@@ -220,22 +237,14 @@ class SingleArmFollower:
                     self.latest_joint_state = joint_state
                     # Apply joint positions to follower
                     self.apply_joint_positions(joint_state)
-
-                # If we have a latest state, keep applying it (hold position)
+                    # Compute and store end effector pose
+                    self.latest_pose = self.compute_end_effector_pose(joint_state)
                 elif self.latest_joint_state is not None:
                     self.apply_joint_positions(self.latest_joint_state)
 
-                # Print statistics periodically
-                self.print_statistics()
-
                 # Check connection status
                 if not self.connected:
-                    print("Lost connection to Leader. Attempting to reconnect...")
-                    try:
-                        self.connect_to_leader()
-                    except RuntimeError:
-                        print("Reconnection failed. Exiting...")
-                        break
+                    self.connect_to_leader()
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 break
@@ -267,10 +276,7 @@ def main():
     socket_host = "localhost"
     socket_port = 12345
 
-    # URDF path - relative to lerobot/assets or absolute path
-    urdf_path = "so101/so101_new_calib.urdf"
-
-    # Transmission frequency
+    # Control frequency
     frequency = 100.0  # Hz
 
     try:
@@ -279,7 +285,6 @@ def main():
             port=port,
             socket_host=socket_host,
             socket_port=socket_port,
-            urdf_path=urdf_path,
             frequency=frequency,
             calibration_dir=None,
         )

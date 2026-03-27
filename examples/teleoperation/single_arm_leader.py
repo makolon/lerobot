@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import lerobot
 import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
@@ -15,11 +16,19 @@ from lerobot.utils.rotation import Rotation
 
 
 @dataclass
+class JointData:
+    """Structure to hold received joint state data"""
+
+    joint_positions: dict  # Joint name to position mapping
+    timestamp: float
+
+
+@dataclass
 class PoseData:
     """Structure to hold pose data with position, orientation, and joint states"""
+
     position: np.ndarray  # [x, y, z]
     orientation: np.ndarray  # [qx, qy, qz, qw]
-    joint_positions: dict  # Joint name to position mapping for transmission (includes gripper)
     timestamp: float
 
 
@@ -31,7 +40,6 @@ class SingleArmLeader:
         port: str,
         socket_host: str = "localhost",
         socket_port: int = 12345,
-        urdf_path: str = "src/lerobot/assets/so101/so101_new_calib.urdf",
         frequency: float = 100.0,
         calibration_dir: str = None,
     ):
@@ -42,7 +50,6 @@ class SingleArmLeader:
             port: Serial port for SO100 leader arm
             socket_host: Host address for socket connection
             socket_port: Port for socket connection
-            urdf_path: Path to the robot URDF file
             frequency: Transmission frequency in Hz
             calibration_dir: Directory for calibration files
         """
@@ -50,11 +57,16 @@ class SingleArmLeader:
         self.socket_host = socket_host
         self.socket_port = socket_port
 
+        # Resolve URDF path with a packaged default when none is provided
+        base_dir = Path(lerobot.__file__).resolve().parent
+        resolved_urdf_path = base_dir / "assets" / "so101" / "robot.urdf"
+
+        if not resolved_urdf_path.exists():
+            raise FileNotFoundError(f"URDF file not found: {resolved_urdf_path}")
+
         # Initialize single arm leader configuration
         self.leader_config = SO100LeaderConfig(
-            port=port,
-            calibration_dir=calibration_dir,
-            id="single_arm_leader"
+            port=port, calibration_dir=calibration_dir, id="single_arm_leader"
         )
 
         # Initialize single arm leader
@@ -64,13 +76,8 @@ class SingleArmLeader:
         self.leader_joint_names = list(self.leader.bus.motors)
         print(f"Leader joint names: {self.leader_joint_names}")
 
-        # Resolve URDF path to absolute path
-        urdf_path_obj = Path(urdf_path)
-        urdf_path_resolved = str(urdf_path_obj)
-        print(f"Loading URDF from: {urdf_path_resolved}")
-
         self.arm_kinematics = RobotKinematics(
-            urdf_path=urdf_path_resolved,
+            urdf_path=str(resolved_urdf_path),
             target_frame_name="gripper_frame_link",
             joint_names=self.leader_joint_names,
         )
@@ -112,30 +119,33 @@ class SingleArmLeader:
         except Exception as e:
             print(f"Error accepting client: {e}")
 
-    def get_joint_positions(self):
+    def get_joint_positions(self) -> JointData:
         """Get current joint positions from the arm"""
         action_dict = self.leader.get_action()
 
         # Extract joint positions for arm in correct order
-        arm_joints = []
+        joint_positions = {}
         for motor_name in self.leader_joint_names:
             key = f"{motor_name}.pos"
             if key in action_dict:
-                arm_joints.append(action_dict[key])
+                joint_positions[motor_name] = action_dict[key]
             else:
                 print(f"Warning: Key '{key}' not found in action_dict")
 
-        return np.array(arm_joints)
+        return JointData(joint_positions=joint_positions, timestamp=time.time())
 
-    def compute_end_effector_poses(self, arm_joints):
-        """Compute end effector poses from joint positions and process gripper commands"""
+    def compute_end_effector_poses(self, joint_data: JointData) -> PoseData | None:
+        """Compute end effector poses from joint positions"""
         if self.arm_kinematics is None:
             return None
+
+        # Convert joint_positions dict to array in correct order
+        arm_joints = np.array([joint_data.joint_positions[name] for name in self.leader_joint_names])
 
         # Ensure joint arrays have correct size
         if arm_joints.size == 0:
             print("Warning: Empty joint arrays received")
-            return None, None
+            return None
 
         # Compute forward kinematics for arm
         ee_transform = self.arm_kinematics.forward_kinematics(arm_joints)
@@ -144,34 +154,29 @@ class SingleArmLeader:
         ee_pose = PoseData(
             position=ee_transform[:3, 3],
             orientation=Rotation.from_matrix(ee_transform[:3, :3]).as_quat(),
-            joint_positions={
-                **{name: float(val) for name, val in zip(self.leader_joint_names, arm_joints, strict=True)},
-            },
-            timestamp=time.time()
+            timestamp=time.time(),
         )
 
         return ee_pose
 
-    def create_pose_message(self, arm_pose):
+    def create_leader_message(self, ee_data: PoseData, joint_data: JointData):
         """Create JSON message with arm pose and joint positions"""
         message = {
             "timestamp": time.time(),
             "end_effector": {
                 "position": {
-                    "px": float(arm_pose.position[0]),
-                    "py": float(arm_pose.position[1]),
-                    "pz": float(arm_pose.position[2])
+                    "px": float(ee_data.position[0]),
+                    "py": float(ee_data.position[1]),
+                    "pz": float(ee_data.position[2]),
                 },
                 "orientation": {
-                    "qx": float(arm_pose.orientation[0]),
-                    "qy": float(arm_pose.orientation[1]),
-                    "qz": float(arm_pose.orientation[2]),
-                    "qw": float(arm_pose.orientation[3])
-                }
+                    "qx": float(ee_data.orientation[0]),
+                    "qy": float(ee_data.orientation[1]),
+                    "qz": float(ee_data.orientation[2]),
+                    "qw": float(ee_data.orientation[3]),
+                },
             },
-            "joints": {
-                "arm": arm_pose.joint_positions
-            }
+            "joints": {"arm": joint_data.joint_positions},
         }
         return json.dumps(message) + "\n"
 
@@ -181,7 +186,7 @@ class SingleArmLeader:
 
         for client in self.connected_clients:
             try:
-                client.send(message.encode('utf-8'))
+                client.send(message.encode("utf-8"))
             except (OSError, BrokenPipeError):
                 disconnected_clients.append(client)
 
@@ -206,26 +211,17 @@ class SingleArmLeader:
                 # Accept new client connections
                 self.accept_new_clients()
 
-                # Get joint positions and gripper commands from arm
-                arm_joints = self.get_joint_positions()
+                # Get joint positions from arm
+                joint_data = self.get_joint_positions()
 
-                # Debug: Print joint array sizes occasionally
-                if int(time.time() * 10) % 50 == 0:  # Print every 5 seconds
-                    print(f"Debug: Arm joints shape: {arm_joints.shape}")
+                # Compute end effector poses
+                ee_data = self.compute_end_effector_poses(joint_data)
 
-                if arm_joints.size > 0:
-                    # Compute end effector poses with gripper commands
-                    arm_pose = self.compute_end_effector_poses(arm_joints)
-
-                    if arm_pose is not None:
-                        # Create and send message
-                        message = self.create_pose_message(arm_pose)
-                        if self.connected_clients:
-                            self.send_to_clients(message)
-
-                        # Debug output (reduce frequency for readability)
-                        if int(time.time() * 2) % 2 == 0:  # Print every 0.5 seconds
-                            print(f"Arm - Pos: {arm_pose.position}, Rot: {arm_pose.orientation}, Joints: {arm_pose.joint_positions}")
+                if ee_data is not None:
+                    # Create and send message
+                    message = self.create_leader_message(ee_data, joint_data)
+                    if self.connected_clients:
+                        self.send_to_clients(message)
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 break
@@ -258,13 +254,11 @@ def main():
 
     # Configuration - Update this port according to your setup
     port = "/dev/tty.usbmodem5A7A0181491"
+    port = "/dev/tty.usbmodem5AF71735431"
 
     # Socket configuration
     socket_host = "localhost"
     socket_port = 12345
-
-    # URDF path - relative to lerobot/assets or absolute path
-    urdf_path = "so101/so101_new_calib.urdf"
 
     # Transmission frequency
     frequency = 100.0  # Hz
@@ -275,7 +269,6 @@ def main():
             port=port,
             socket_host=socket_host,
             socket_port=socket_port,
-            urdf_path=urdf_path,
             frequency=frequency,
             calibration_dir=None,
         )
@@ -288,7 +281,7 @@ def main():
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        if 'leader' in locals():
+        if "leader" in locals():
             leader.disconnect()
 
 
