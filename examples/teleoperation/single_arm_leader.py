@@ -23,6 +23,25 @@ class PoseData:
     timestamp: float
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ASSETS_ROOT = REPO_ROOT / "src" / "lerobot" / "assets"
+
+
+def resolve_urdf_path(urdf_path: str) -> str:
+    path = Path(urdf_path)
+    if path.is_absolute():
+        return str(path)
+    repo_candidate = REPO_ROOT / path
+    if repo_candidate.exists():
+        return str(repo_candidate)
+    assets_candidate = ASSETS_ROOT / path
+    if assets_candidate.exists():
+        return str(assets_candidate)
+    if path.exists():
+        return str(path)
+    raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+
+
 class SingleArmLeader:
     """Sends single arm SO100 leader End Effector poses via socket at high frequency"""
 
@@ -64,9 +83,8 @@ class SingleArmLeader:
         self.leader_joint_names = list(self.leader.bus.motors)
         print(f"Leader joint names: {self.leader_joint_names}")
 
-        # Resolve URDF path to absolute path
-        urdf_path_obj = Path(urdf_path)
-        urdf_path_resolved = str(urdf_path_obj)
+        # Resolve URDF path to an existing file
+        urdf_path_resolved = resolve_urdf_path(urdf_path)
         print(f"Loading URDF from: {urdf_path_resolved}")
 
         self.arm_kinematics = RobotKinematics(

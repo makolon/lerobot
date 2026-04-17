@@ -203,6 +203,11 @@ def main() -> int:
         action="store_true",
         help="Force enable torque before executing the trajectory",
     )
+    parser.add_argument(
+        "--keep-torque",
+        action="store_true",
+        help="Keep torque enabled after finishing by not disabling it on disconnect",
+    )
 
     args = parser.parse_args()
 
@@ -213,7 +218,7 @@ def main() -> int:
         port=args.port,
         id=args.id,
         use_degrees=args.use_degrees,
-        disable_torque_on_disconnect=True,
+        disable_torque_on_disconnect=not args.keep_torque,
     )
     robot = SO100Follower(robot_config)
 
